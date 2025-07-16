@@ -108,17 +108,19 @@ for ep in range(1, epochs+1):
 
 # test_a = torch.load('ufno/data/darcy_test_128.pt')['x'].to(torch.float32)[:400]
 # test_u = torch.load('ufno/data/darcy_test_128.pt')['y'].to(torch.float32)[:400]
-# test_a, test_u = _resize_batch(test_a, test_u)
+test_a = torch.load('ufno/data/burgers_test_16.pt')['x'].to(torch.float32)[:200]
+test_u = torch.load('ufno/data/burgers_test_16.pt')['y'].to(torch.float32)[:200]
+test_a, test_u = _resize_batch(test_a, test_u)
 
-# test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=batch_size, shuffle=True)
+test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=batch_size, shuffle=True)
 
-# model.eval()
-# loss_fn = nn.MSELoss()
-# test_loss = 0.0
-# with torch.no_grad():
-#     for xb, yb in test_loader:
-#         xb, yb = xb.cuda(), yb.cuda()
-#         pred = model(xb)
-#         loss = loss_fn(pred, yb.squeeze())
-#         test_loss += loss.item()
-# print(f"Test MSE Loss: {test_loss / len(test_loader):.6f}")
+model.eval()
+loss_fn = nn.MSELoss()
+test_loss = 0.0
+with torch.no_grad():
+    for xb, yb in test_loader:
+        xb, yb = xb.cuda(), yb.cuda()
+        pred = model(xb)
+        loss = loss_fn(pred, yb.squeeze())
+        test_loss += loss.item()
+print(f"Test MSE Loss: {test_loss / len(test_loader):.6f}")
