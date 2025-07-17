@@ -1,9 +1,10 @@
 import torch
+import os
 import torch.nn as nn
 import numpy as np
 from ufno import *
-from lploss import *
 from ufno import Net3d 
+from lploss import *
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -13,6 +14,24 @@ import torch.nn.functional as F
 sys.path.append("C:/Users/Chloe/Desktop/garcia")
 from neuraloperator.neuralop.data.datasets import load_mini_burgers_1dtime
 
+class TeeLogger:
+    def __init__(self, filepath):
+        self.terminal = sys.stdout
+        self.log = open(filepath, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+# Redirect stdout/stderr to log file
+os.makedirs("logs", exist_ok=True)
+log_path = "logs/burgers_train_log.txt"
+sys.stdout = TeeLogger(log_path)
+sys.stderr = sys.stdout
 
 def _resize_batch(x,y):
     print (x.shape, y.shape)
@@ -43,8 +62,8 @@ def _resize_batch(x,y):
     print (x_resized.shape, y_resized.shape)
     return x_resized.float(), y_resized.float()
 
-# train_a = torch.load('ufno/data/darcy_train_128.pt')['x'].to(torch.float32)[:1000]
-# train_u = torch.load('ufno/data/darcy_train_128.pt')['y'].to(torch.float32)[:1000]
+# train_a = torch.load('ufno/data/nsforcing_train_128.pt')['x'].to(torch.float32)[:1000]
+# train_u = torch.load('ufno/data/nsforcing_train_128.pt')['y'].to(torch.float32)[:1000]
 train_a = torch.load('ufno/data/burgers_train_16.pt')['x'].to(torch.float32)[:1000]
 train_u = torch.load('ufno/data/burgers_train_16.pt')['y'].to(torch.float32)[:1000]
 train_a, train_u = _resize_batch(train_a, train_u)
@@ -102,25 +121,60 @@ for ep in range(1, epochs+1):
     print(f'epoch: {ep}, train loss: {train_l2/train_a.shape[0]:.4f}')
 
     lr_ = optimizer.param_groups[0]['lr']
-    if ep % 2 == 0:
-        PATH = f'TrainedModels/Darcy_UFNO_{ep}ep_{width}width_{mode1}m1_{mode2}m2_{train_a.shape[0]}train_{lr_:.2e}lr'
+    if ep % 100 == 0:
+        PATH = f'TrainedModels/burgers_UFNO_{ep}ep_{width}width_{mode1}m1_{mode2}m2_{train_a.shape[0]}train_{lr_:.2e}lr'
         torch.save(model, PATH)
 
-# test_a = torch.load('ufno/data/darcy_test_128.pt')['x'].to(torch.float32)[:400]
-# test_u = torch.load('ufno/data/darcy_test_128.pt')['y'].to(torch.float32)[:400]
+# test_a = torch.load('ufno/data/nsforcing_test_128.pt')['x'].to(torch.float32)[:400]
+# test_u = torch.load('ufno/data/nsforcing_test_128.pt')['y'].to(torch.float32)[:400]
 test_a = torch.load('ufno/data/burgers_test_16.pt')['x'].to(torch.float32)[:200]
 test_u = torch.load('ufno/data/burgers_test_16.pt')['y'].to(torch.float32)[:200]
 test_a, test_u = _resize_batch(test_a, test_u)
 
 test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=batch_size, shuffle=True)
 
+def compute_l2_loss(pred, target):
+    """Computes the L2 norm of the error over the whole batch."""
+    error = pred - target
+    return torch.norm(error.reshape(error.shape[0], -1), dim=1).mean()
+
+def compute_h1_loss(pred, target, spacing=(1.0, 1.0, 1.0)):
+    """
+    Computes the H1 semi-norm:
+        ||u - u_true||_{H1} = sqrt(||u - u_true||^2 + ||∇(u - u_true)||^2)
+    Assumes input is [B, X, Y, T, C]
+    """
+    error = pred - target
+    l2 = torch.norm(error.reshape(error.shape[0], -1), dim=1)**2
+
+    grad_error = 0.0
+    for d in range(1, 4):  # spatial dims: X, Y, T
+        grad = torch.diff(error, dim=d, n=1)
+        grad_spacing = spacing[d-1]
+        grad_error += (grad ** 2).sum(dim=(1,2,3,4)) / grad_spacing**2
+
+    return (l2 + grad_error).sqrt().mean()
+
+
 model.eval()
-loss_fn = nn.MSELoss()
-test_loss = 0.0
+l2_total = 0.0
+h1_total = 0.0
 with torch.no_grad():
     for xb, yb in test_loader:
-        xb, yb = xb.cuda(), yb.cuda()
+        # print (xb.shape, yb.shape)
+        xb, yb = xb.to(device), yb.to(device)
         pred = model(xb)
-        loss = loss_fn(pred, yb.squeeze())
-        test_loss += loss.item()
-print(f"Test MSE Loss: {test_loss / len(test_loader):.6f}")
+        # print (pred.shape)
+        
+        pred = pred.unsqueeze(-1)
+
+        l2 = compute_l2_loss(pred, yb)
+        h1 = compute_h1_loss(pred, yb)
+
+        l2_total += l2.item()
+        h1_total += h1.item()
+
+num_batches = len(test_loader)
+print(f"Test L2 Norm: {l2_total / num_batches:.6f}")
+print(f"Test H1 Norm: {h1_total / num_batches:.6f}")
+
