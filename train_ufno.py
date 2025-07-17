@@ -82,7 +82,7 @@ model.to(device)
 print(f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
 
-epochs = 1
+epochs = 500
 e_start = 0
 learning_rate = 0.001
 scheduler_step = 2
