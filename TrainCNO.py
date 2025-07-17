@@ -25,7 +25,7 @@ class TeeLogger:
         self.log.flush()
 
 os.makedirs("logs", exist_ok=True)
-sys.stdout = TeeLogger("logs/darcy_cno_train_log.txt")
+sys.stdout = TeeLogger("logs/navier_stokes_cno_train_log.txt")
 sys.stderr = sys.stdout 
 
 if len(sys.argv) <= 2:
@@ -37,7 +37,7 @@ if len(sys.argv) <= 2:
         "scheduler_gamma": 0.98,
         "epochs":500,
         "batch_size": 16,
-        "exp": 1,                # Do we use L1 or L2 errors? Default: L1
+        "exp": 2,                # Do we use L1 or L2 errors? Default: L1
         "training_samples": 800  # How many training samples?
     }
     model_architecture_ = {
@@ -75,7 +75,7 @@ if len(sys.argv) <= 2:
     #   darcy               : Darcy Flow
 
     # which_example = sys.argv[1]
-    which_example = "darcy"
+    which_example = "ns"
 
     # Save the models here:
     folder = "TrainedModels/"+"CNO_"+which_example+"_1"
@@ -136,8 +136,10 @@ else:
 #-----------------------------------Train--------------------------------------
 model = example.model
 n_params = model.print_size()
+n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Model has {n_params:,} trainable parameters")
 train_loader = example.train_loader #TRAIN LOADER
-val_loader = example.val_loader #VALIDATION LOADER
+test_loader = example.test_loader #Test LOADER
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
@@ -148,105 +150,59 @@ if p == 1:
 elif p == 2:
     loss = torch.nn.MSELoss()
     
-best_model_testing_error = 1000 #Save the model once it has less than 1000% relative L1 error
-patience = int(0.2 * epochs)    # Early stopping parameter
-counter = 0
-
-if str(device) == 'cpu':
-    print("------------------------------------------")
-    print("YOU ARE RUNNING THE CODE ON A CPU.")
-    print("WE SUGGEST YOU TO RUN THE CODE ON A GPU!")
-    print("------------------------------------------")
-    print(" ")
-
-
 for epoch in range(epochs):
     with tqdm(unit="batch", disable=False) as tepoch:
-        
         model.train()
         tepoch.set_description(f"Epoch {epoch}")
         train_mse = 0.0
-        running_relative_train_mse = 0.0
-        for step, (input_batch, output_batch) in enumerate(train_loader):  
+        for step, (input_batch, output_batch) in enumerate(train_loader):
             optimizer.zero_grad()
             input_batch = input_batch.to(device)
             output_batch = output_batch.to(device)
-            # input_batch = batch['x'].to(device)
-            # output_batch = batch['y'].to(device)
-
             output_pred_batch = model(input_batch)
 
-            if which_example == "airfoil": #Mask the airfoil shape
-                output_pred_batch[input_batch==1] = 1
-                output_batch[input_batch==1] = 1
+            if which_example == "airfoil":
+                output_pred_batch[input_batch == 1] = 1
+                output_batch[input_batch == 1] = 1
 
             loss_f = loss(output_pred_batch, output_batch) / loss(torch.zeros_like(output_batch).to(device), output_batch)
-
             loss_f.backward()
             optimizer.step()
             train_mse = train_mse * step / (step + 1) + loss_f.item() / (step + 1)
-            tepoch.set_postfix({'Batch': step + 1, 'Train loss (in progress)': train_mse})
+            tepoch.set_postfix({'Train Loss': train_mse})
 
         writer.add_scalar("train_loss/train_loss", train_mse, epoch)
-        
+
         with torch.no_grad():
             model.eval()
-            test_relative_l2 = 0.0
-            train_relative_l2 = 0.0
-            
-            for step, (input_batch, output_batch) in enumerate(val_loader):
-                
+            total_l2 = 0.0
+            total_h1 = 0.0
+            for step, (input_batch, output_batch) in enumerate(test_loader):
                 input_batch = input_batch.to(device)
                 output_batch = output_batch.to(device)
                 output_pred_batch = model(input_batch)
-                
-                if which_example == "airfoil": #Mask the airfoil shape
-                    output_pred_batch[input_batch==1] = 1
-                    output_batch[input_batch==1] = 1
-                
-                loss_f = torch.mean(abs(output_pred_batch - output_batch)) / torch.mean(abs(output_batch)) * 100
-                test_relative_l2 += loss_f.item()
-            test_relative_l2 /= len(val_loader)
 
-            for step, (input_batch, output_batch) in enumerate(train_loader):
-                input_batch = input_batch.to(device)
-                output_batch = output_batch.to(device)
-                output_pred_batch = model(input_batch)
-                    
-                if which_example == "airfoil": #Mask the airfoil shape
-                    output_pred_batch[input_batch==1] = 1
-                    output_batch[input_batch==1] = 1
+                if which_example == "airfoil":
+                    output_pred_batch[input_batch == 1] = 1
+                    output_batch[input_batch == 1] = 1
 
-                    loss_f = torch.mean(abs(output_pred_batch - output_batch)) / torch.mean(abs(output_batch)) * 100
-                    train_relative_l2 += loss_f.item()
-            train_relative_l2 /= len(train_loader)
-            
-            writer.add_scalar("train_loss/train_loss_rel", train_relative_l2, epoch)
-            writer.add_scalar("val_loss/val_loss", test_relative_l2, epoch)
+                l2_error = torch.norm(output_pred_batch - output_batch) / torch.norm(output_batch)
+                grad_output_pred = torch.gradient(output_pred_batch, dim=(-2, -1))
+                grad_output_true = torch.gradient(output_batch, dim=(-2, -1))
+                h1_error = sum(torch.norm(gp - gt) for gp, gt in zip(grad_output_pred, grad_output_true))
+                total_l2 += l2_error.item()
+                total_h1 += h1_error.item()
 
-            if test_relative_l2 < best_model_testing_error:
-                best_model_testing_error = test_relative_l2
-                best_model = copy.deepcopy(model)
-                torch.save(best_model, folder + "/model.pkl")
-                writer.add_scalar("val_loss/Best Relative Testing Error", best_model_testing_error, epoch)
-                counter = 0
-            else:
-                counter+=1
+            avg_l2 = total_l2 / len(test_loader)
+            avg_h1 = total_h1 / len(test_loader)
+            writer.add_scalar("test/L2_error", avg_l2, epoch)
+            writer.add_scalar("test/H1_error", avg_h1, epoch)
+            print(f"\nEpoch {epoch}: Test L2 Error = {avg_l2:.6f}, H1 Error = {avg_h1:.6f}")
 
-        tepoch.set_postfix({'Train loss': train_mse, "Relative Train": train_relative_l2, "Relative Val loss": test_relative_l2})
         tepoch.close()
-
-        with open(folder + '/errors.txt', 'w') as file:
-            file.write("Training Error: " + str(train_mse) + "\n")
-            file.write("Best Testing Error: " + str(best_model_testing_error) + "\n")
-            file.write("Current Epoch: " + str(epoch) + "\n")
-            file.write("Params: " + str(n_params) + "\n")
-        print ("Training Error: " + str(train_mse) + "\n")
-        print ("Testing Error: " + str(test_relative_l2) + "\n")
-        print ("Current Epoch: " + str(epoch) + "\n")
-        print ("Params: " + str(n_params) + "\n")
         scheduler.step()
 
-    if counter>patience:
-        print("Early Stopping")
-        break
+# Save model at last epoch
+final_model_path = folder + ".pth"
+torch.save(model.state_dict(), final_model_path)
+print(f"Final model saved to {final_model_path}")
