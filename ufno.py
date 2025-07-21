@@ -1,188 +1,124 @@
 import torch
-import os
-import time
 import torch.nn as nn
-import numpy as np
-from ufno import *
-from ufno import Net3d 
-from lploss import *
+import torch.nn.functional as F
+
+import operator
+from functools import reduce
+from functools import partial
 
 torch.manual_seed(0)
-np.random.seed(0)
 
-import sys
-import torch.nn.functional as F
-sys.path.append("C:/Users/Chloe/Desktop/garcia")
-from neuraloperator.neuralop.data.datasets import load_mini_burgers_1dtime
+class SpectralConv3d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2, modes3):
+        super(SpectralConv3d, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1, self.modes2, self.modes3 = modes1, modes2, modes3
+        self.scale = (1 / (in_channels * out_channels))
+        self.weights = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, modes1, modes2, modes3, dtype=torch.cfloat)
+        )
 
-class TeeLogger:
-    def __init__(self, filepath):
-        self.terminal = sys.stdout
-        self.log = open(filepath, "w", encoding="utf-8")
+    def compl_mul3d(self, input, weights):
+        return torch.einsum("bixyz,ioxyz->boxyz", input, weights)
 
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
+    def forward(self, x):
+        batchsize = x.shape[0]
+        x_ft = torch.fft.rfftn(x, dim=[-3,-2,-1])
+        out_ft = torch.zeros(batchsize, self.out_channels, x.size(-3), x.size(-2), x.size(-1)//2 + 1,
+                             dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes2, :self.modes3] = self.compl_mul3d(
+            x_ft[:, :, :self.modes1, :self.modes2, :self.modes3], self.weights)
+        x = torch.fft.irfftn(out_ft, s=(x.size(-3), x.size(-2), x.size(-1)))
+        return x
 
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
+class U_net(nn.Module):
+    def __init__(self, input_channels, output_channels, kernel_size, dropout_rate):
+        super(U_net, self).__init__()
+        self.down = nn.Sequential(
+            nn.Conv3d(input_channels, output_channels * 2, kernel_size=kernel_size, stride=2, padding=1),
+            nn.GroupNorm(1, output_channels * 2),
+            nn.ReLU(),
+            nn.Conv3d(output_channels * 2, output_channels, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
+            nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
 
-# Redirect stdout/stderr to log file
-os.makedirs("logs", exist_ok=True)
-log_path = "logs/darcy_ufno_train_log.txt"
-sys.stdout = TeeLogger(log_path)
-sys.stderr = sys.stdout
+    def forward(self, x):
+        x_down = self.down(x)
+        x_up = self.up(x_down)
+        return x_up
 
-def _resize_batch(x,y):
-    print (x.shape, y.shape)
-    if x.ndim == 2:
-        x = x.unsqueeze(1)  # [B, 1, H, W]
-    if x.ndim == 3:
-        x = x.unsqueeze(1)  # [B, 1, H, W]
-    if y.ndim == 3:
-        y = y.unsqueeze(1)  # [B, 1, H, W]
-    print (x.shape, y.shape)
 
-    x_resized = F.interpolate(x, size=(200, 24), mode='bilinear', align_corners=False)  # [B, C=1, X, T]
-    y_resized = F.interpolate(y, size=(200, 24), mode='bilinear', align_corners=False)
+class SimpleBlock3d(nn.Module):
+    def __init__(self, modes1, modes2, modes3, width=16):  # was 12
+        super(SimpleBlock3d, self).__init__()
+        self.width = width
+        self.fc0 = nn.Linear(12, width)
 
-    x_resized = x_resized.unsqueeze(3)  # insert dim at pos 3
-    y_resized = y_resized.unsqueeze(3)
+        self.conv0 = SpectralConv3d(width, width, modes1, modes2, modes3)
+        self.conv1 = SpectralConv3d(width, width, modes1, modes2, modes3)
+        self.conv2 = SpectralConv3d(width, width, modes1, modes2, modes3)
 
-    # Permute to [B, X, Y, T, C]
-    x_resized = x_resized.permute(0, 2, 3, 4, 1)
-    y_resized = y_resized.permute(0, 2, 3, 4, 1)
+        self.w0 = nn.Conv1d(width, width, 1)
+        self.w1 = nn.Conv1d(width, width, 1)
+        self.w2 = nn.Conv1d(width, width, 1)
 
-    # Now add dummy channels to input to have 12 channels
-    # For demonstration, replicate the single channel 12 times
-    x_resized = x_resized.repeat(1, 1, 96, 1, 12)  # [B, X, 96, T, 12]
-    y_resized = y_resized.repeat(1, 1, 96, 1, 1)
+        self.unet = U_net(width, width, kernel_size=3, dropout_rate=0)
 
-    # Output y stays with 1 channel: [B, X, Y, T, 1]
-    print (x_resized.shape, y_resized.shape)
-    return x_resized.float(), y_resized.float()
+        self.fc1 = nn.Linear(width, 64)   # was 32
+        self.fc2 = nn.Linear(64, 1)
 
-train_a = torch.load('ufno/data/darcy_train_128.pt')['x'].to(torch.float32)[:1000]
-train_u = torch.load('ufno/data/darcy_train_128.pt')['y'].to(torch.float32)[:1000]
-# train_a = torch.load('ufno/data/burgers_train_16.pt')['x'].to(torch.float32)[:1000]
-# train_u = torch.load('ufno/data/burgers_train_16.pt')['y'].to(torch.float32)[:1000]
-train_a, train_u = _resize_batch(train_a, train_u)
+    def forward(self, x):
+        b, x_len, y_len, z_len, _ = x.shape
+        x = self.fc0(x)
+        x = x.permute(0, 4, 1, 2, 3)
 
-mode1 = 10
-mode2 = 10
-mode3 = 10
-width = 36
-device = torch.device('cuda:0')
-model = Net3d(modes1=10, modes2=10, modes3=10, width=16)
+        x1 = self.conv0(x)
+        x2 = self.w0(x.view(b, self.width, -1)).view(b, self.width, x_len, y_len, z_len)
+        x = F.relu(x1 + x2)
 
-# model = Net3d(mode1, mode2, mode3, width)
-    
-model.to(device)
+        x1 = self.conv1(x)
+        x2 = self.w1(x.view(b, self.width, -1)).view(b, self.width, x_len, y_len, z_len)
+        x = F.relu(x1 + x2)
 
-print(f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+        x1 = self.conv2(x)
+        x2 = self.w2(x.view(b, self.width, -1)).view(b, self.width, x_len, y_len, z_len)
+        x3 = self.unet(x)
+        x = F.relu(x1 + x2 + x3)
 
-epochs = 500
-e_start = 0
-learning_rate = 0.001
-scheduler_step = 2
-scheduler_gamma = 0.9
+        x = x.permute(0, 2, 3, 4, 1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
 
-batch_size = 16
 
-train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_a, train_u), batch_size=batch_size, shuffle=True)
+class Net3d(nn.Module):
+    def __init__(self, modes1, modes2, modes3, width):
+        super(Net3d, self).__init__()
 
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
-myloss = LpLoss(size_average=False)
+        """
+        A wrapper function
+        """
 
-test_a = torch.load('ufno/data/darcy_test_128.pt')['x'].to(torch.float32)[:400]
-test_u = torch.load('ufno/data/darcy_test_128.pt')['y'].to(torch.float32)[:400]
-# test_a = torch.load('ufno/data/burgers_test_16.pt')['x'].to(torch.float32)[:200]
-# test_u = torch.load('ufno/data/burgers_test_16.pt')['y'].to(torch.float32)[:200]
-test_a, test_u = _resize_batch(test_a, test_u)
+        self.conv1 = SimpleBlock3d(modes1, modes2, modes3, width)
 
-test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=batch_size, shuffle=True)
 
-def compute_l2_loss(pred, target):
-    """Computes the normalized L2 norm of the error over the whole batch."""
-    error = pred - target
-    # Flatten everything except batch
-    error_flat = error.reshape(error.shape[0], -1)
-    norm = torch.norm(error_flat, dim=1)
-    # Normalize by number of elements per sample
-    norm /= error_flat.shape[1] ** 0.5
-    return norm.mean()
+    def forward(self, x):
+        batchsize = x.shape[0]
+        size_x, size_y, size_z = x.shape[1], x.shape[2], x.shape[3]
+        x = F.pad(F.pad(x, (0,0,0,8,0,8), "replicate"), (0,0,0,0,0,0,0,8), 'constant', 0)
+        x = self.conv1(x)
+        x = x.view(batchsize, size_x+8, size_y+8, size_z+8, 1)[..., :-8,:-8,:-8, :]
+        return x.squeeze()
 
-def compute_h1_loss(pred, target, spacing=(1.0, 1.0, 1.0)):
-    """
-    Computes the normalized H1 semi-norm:
-        ||u - u_true||_{H1} = sqrt(||u - u_true||^2 + ||∇(u - u_true)||^2)
-    Assumes input shape is [B, X, Y, T, C]
-    """
-    error = pred - target
-    batch_size = error.shape[0]
-    num_points = torch.numel(error[0])  # total points per sample
 
-    # Compute squared L2 part
-    l2 = torch.norm(error.reshape(batch_size, -1), dim=1)**2
+    def count_params(self):
+        c = 0
+        for p in self.parameters():
+            c += reduce(operator.mul, list(p.size()))
 
-    # Compute squared gradient part
-    grad_error = 0.0
-    for d in range(1, 4):  # spatial dims: X, Y, T
-        grad = torch.diff(error, dim=d, n=1)
-        grad_spacing = spacing[d - 1]
-        grad_error += (grad ** 2).sum(dim=(1, 2, 3, 4)) / grad_spacing**2
-
-    # Normalize both parts by number of points (approximate integral normalization)
-    total = (l2 + grad_error) / num_points
-    return torch.sqrt(total).mean()
-
-for ep in range(1, epochs+1):
-    start_time = time.time()
-    model.train()
-    train_l2 = 0
-    counter = 0
-    for x, y in train_loader:
-        x, y = x.to(device), y.to(device)
-
-        optimizer.zero_grad()
-        pred = model(x)
-        loss = myloss(pred.view(y.shape), y)  # Ensure shapes match
-        loss.backward()
-        optimizer.step()
-
-        train_l2 += loss.item()
-        counter += 1
-
-        if counter % 100 == 0:
-            print(f'epoch: {ep}, batch: {counter}/{len(train_loader)}, train loss: {loss.item()/batch_size:.4f}')
-    
-    scheduler.step()
-    print(f'epoch: {ep}, train loss: {train_l2/train_a.shape[0]:.4f}')
-
-    model.eval()
-    l2_total = 0.0
-    h1_total = 0.0
-    with torch.no_grad():
-        for xb, yb in test_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            pred = model(xb)
-            pred = pred.unsqueeze(-1)
-
-            l2 = compute_l2_loss(pred, yb)
-            h1 = compute_h1_loss(pred, yb)
-
-            l2_total += l2.item()
-            h1_total += h1.item()
-
-    num_batches = len(test_loader)
-    print(f"        Test L2 Norm: {l2_total / num_batches:.6f}")
-    print(f"        Test H1 Norm: {h1_total / num_batches:.6f}")
-    epoch_time = time.time() - start_time  # End timer
-    print(f"        Epoch {ep} took {epoch_time:.2f} seconds.")
-
-    lr_ = optimizer.param_groups[0]['lr']
-    if ep % 500 == 0:
-        PATH = f'TrainedModels/darcy_UFNO_{ep}ep_{width}width_{mode1}m1_{mode2}m2_{train_a.shape[0]}train_{lr_:.2e}lr.pth'
-        torch.save(model.state_dict(), PATH)
+        return c
