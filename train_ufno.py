@@ -1,5 +1,6 @@
 import torch
 import os
+import time
 import torch.nn as nn
 import numpy as np
 from ufno import *
@@ -83,7 +84,7 @@ print(f"Number of trainable parameters: {sum(p.numel() for p in model.parameters
 
 epochs = 500
 e_start = 0
-learning_rate = 0.0001
+learning_rate = 0.001
 scheduler_step = 2
 scheduler_gamma = 0.9
 
@@ -104,51 +105,41 @@ test_a, test_u = _resize_batch(test_a, test_u)
 test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=batch_size, shuffle=True)
 
 def compute_l2_loss(pred, target):
-    """Computes the L2 norm of the error over the whole batch."""
+    """Computes the normalized L2 norm of the error over the whole batch."""
     error = pred - target
-    return torch.norm(error.reshape(error.shape[0], -1), dim=1).mean()
+    # Flatten everything except batch
+    error_flat = error.reshape(error.shape[0], -1)
+    norm = torch.norm(error_flat, dim=1)
+    # Normalize by number of elements per sample
+    norm /= error_flat.shape[1] ** 0.5
+    return norm.mean()
 
 def compute_h1_loss(pred, target, spacing=(1.0, 1.0, 1.0)):
     """
-    Computes the H1 semi-norm:
+    Computes the normalized H1 semi-norm:
         ||u - u_true||_{H1} = sqrt(||u - u_true||^2 + ||∇(u - u_true)||^2)
-    Assumes input is [B, X, Y, T, C]
+    Assumes input shape is [B, X, Y, T, C]
     """
     error = pred - target
-    l2 = torch.norm(error.reshape(error.shape[0], -1), dim=1)**2
+    batch_size = error.shape[0]
+    num_points = torch.numel(error[0])  # total points per sample
 
+    # Compute squared L2 part
+    l2 = torch.norm(error.reshape(batch_size, -1), dim=1)**2
+
+    # Compute squared gradient part
     grad_error = 0.0
     for d in range(1, 4):  # spatial dims: X, Y, T
         grad = torch.diff(error, dim=d, n=1)
-        grad_spacing = spacing[d-1]
-        grad_error += (grad ** 2).sum(dim=(1,2,3,4)) / grad_spacing**2
+        grad_spacing = spacing[d - 1]
+        grad_error += (grad ** 2).sum(dim=(1, 2, 3, 4)) / grad_spacing**2
 
-    return (l2 + grad_error).sqrt().mean()
-
-
-# model.eval()
-# l2_total = 0.0
-# h1_total = 0.0
-# with torch.no_grad():
-#     for xb, yb in test_loader:
-#         # print (xb.shape, yb.shape)
-#         xb, yb = xb.to(device), yb.to(device)
-#         pred = model(xb)
-#         # print (pred.shape)
-        
-#         pred = pred.unsqueeze(-1)
-
-#         l2 = compute_l2_loss(pred, yb)
-#         h1 = compute_h1_loss(pred, yb)
-
-#         l2_total += l2.item()
-#         h1_total += h1.item()
-
-# num_batches = len(test_loader)
-# print(f"Test L2 Norm: {l2_total / num_batches:.6f}")
-# print(f"Test H1 Norm: {h1_total / num_batches:.6f}")
+    # Normalize both parts by number of points (approximate integral normalization)
+    total = (l2 + grad_error) / num_points
+    return torch.sqrt(total).mean()
 
 for ep in range(1, epochs+1):
+    start_time = time.time()
     model.train()
     train_l2 = 0
     counter = 0
@@ -170,7 +161,6 @@ for ep in range(1, epochs+1):
     scheduler.step()
     print(f'epoch: {ep}, train loss: {train_l2/train_a.shape[0]:.4f}')
 
-    # ========== TESTING AT EACH EPOCH ==========
     model.eval()
     l2_total = 0.0
     h1_total = 0.0
@@ -189,7 +179,8 @@ for ep in range(1, epochs+1):
     num_batches = len(test_loader)
     print(f"        Test L2 Norm: {l2_total / num_batches:.6f}")
     print(f"        Test H1 Norm: {h1_total / num_batches:.6f}")
-    # ===============================================
+    epoch_time = time.time() - start_time  # End timer
+    print(f"        Epoch {ep} took {epoch_time:.2f} seconds.")
 
     lr_ = optimizer.param_groups[0]['lr']
     if ep % 500 == 0:
