@@ -29,7 +29,7 @@ class TeeLogger:
 
 # Redirect stdout/stderr to log file
 os.makedirs("logs", exist_ok=True)
-log_path = "logs/burgers_train_log.txt"
+log_path = "logs/darcy_ufno_train_log.txt"
 sys.stdout = TeeLogger(log_path)
 sys.stderr = sys.stdout
 
@@ -62,10 +62,10 @@ def _resize_batch(x,y):
     print (x_resized.shape, y_resized.shape)
     return x_resized.float(), y_resized.float()
 
-# train_a = torch.load('ufno/data/nsforcing_train_128.pt')['x'].to(torch.float32)[:1000]
-# train_u = torch.load('ufno/data/nsforcing_train_128.pt')['y'].to(torch.float32)[:1000]
-train_a = torch.load('ufno/data/burgers_train_16.pt')['x'].to(torch.float32)[:1000]
-train_u = torch.load('ufno/data/burgers_train_16.pt')['y'].to(torch.float32)[:1000]
+train_a = torch.load('ufno/data/darcy_train_128.pt')['x'].to(torch.float32)[:1000]
+train_u = torch.load('ufno/data/darcy_train_128.pt')['y'].to(torch.float32)[:1000]
+# train_a = torch.load('ufno/data/burgers_train_16.pt')['x'].to(torch.float32)[:1000]
+# train_u = torch.load('ufno/data/burgers_train_16.pt')['y'].to(torch.float32)[:1000]
 train_a, train_u = _resize_batch(train_a, train_u)
 
 mode1 = 10
@@ -81,10 +81,9 @@ model.to(device)
 
 print(f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-
 epochs = 500
 e_start = 0
-learning_rate = 0.001
+learning_rate = 0.0001
 scheduler_step = 2
 scheduler_gamma = 0.9
 
@@ -96,39 +95,10 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
 myloss = LpLoss(size_average=False)
 
-train_l2 = 0.0
-for ep in range(1, epochs+1):
-    print (ep)
-    model.train()
-    train_l2 = 0
-    counter = 0
-    for x, y in train_loader:
-        x, y = x.to(device), y.to(device)
-
-        optimizer.zero_grad()
-        pred = model(x)
-        loss = myloss(pred.view(y.shape), y)  # Ensure shapes match
-        loss.backward()
-        optimizer.step()
-
-        train_l2 += loss.item()
-        counter += 1
-
-        if counter % 100 == 0:
-            print(f'epoch: {ep}, batch: {counter}/{len(train_loader)}, train loss: {loss.item()/batch_size:.4f}')
-    
-    scheduler.step()
-    print(f'epoch: {ep}, train loss: {train_l2/train_a.shape[0]:.4f}')
-
-    lr_ = optimizer.param_groups[0]['lr']
-    if ep % 100 == 0:
-        PATH = f'TrainedModels/burgers_UFNO_{ep}ep_{width}width_{mode1}m1_{mode2}m2_{train_a.shape[0]}train_{lr_:.2e}lr'
-        torch.save(model, PATH)
-
-# test_a = torch.load('ufno/data/nsforcing_test_128.pt')['x'].to(torch.float32)[:400]
-# test_u = torch.load('ufno/data/nsforcing_test_128.pt')['y'].to(torch.float32)[:400]
-test_a = torch.load('ufno/data/burgers_test_16.pt')['x'].to(torch.float32)[:200]
-test_u = torch.load('ufno/data/burgers_test_16.pt')['y'].to(torch.float32)[:200]
+test_a = torch.load('ufno/data/darcy_test_128.pt')['x'].to(torch.float32)[:400]
+test_u = torch.load('ufno/data/darcy_test_128.pt')['y'].to(torch.float32)[:400]
+# test_a = torch.load('ufno/data/burgers_test_16.pt')['x'].to(torch.float32)[:200]
+# test_u = torch.load('ufno/data/burgers_test_16.pt')['y'].to(torch.float32)[:200]
 test_a, test_u = _resize_batch(test_a, test_u)
 
 test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=batch_size, shuffle=True)
@@ -156,25 +126,72 @@ def compute_h1_loss(pred, target, spacing=(1.0, 1.0, 1.0)):
     return (l2 + grad_error).sqrt().mean()
 
 
-model.eval()
-l2_total = 0.0
-h1_total = 0.0
-with torch.no_grad():
-    for xb, yb in test_loader:
-        # print (xb.shape, yb.shape)
-        xb, yb = xb.to(device), yb.to(device)
-        pred = model(xb)
-        # print (pred.shape)
+# model.eval()
+# l2_total = 0.0
+# h1_total = 0.0
+# with torch.no_grad():
+#     for xb, yb in test_loader:
+#         # print (xb.shape, yb.shape)
+#         xb, yb = xb.to(device), yb.to(device)
+#         pred = model(xb)
+#         # print (pred.shape)
         
-        pred = pred.unsqueeze(-1)
+#         pred = pred.unsqueeze(-1)
 
-        l2 = compute_l2_loss(pred, yb)
-        h1 = compute_h1_loss(pred, yb)
+#         l2 = compute_l2_loss(pred, yb)
+#         h1 = compute_h1_loss(pred, yb)
 
-        l2_total += l2.item()
-        h1_total += h1.item()
+#         l2_total += l2.item()
+#         h1_total += h1.item()
 
-num_batches = len(test_loader)
-print(f"Test L2 Norm: {l2_total / num_batches:.6f}")
-print(f"Test H1 Norm: {h1_total / num_batches:.6f}")
+# num_batches = len(test_loader)
+# print(f"Test L2 Norm: {l2_total / num_batches:.6f}")
+# print(f"Test H1 Norm: {h1_total / num_batches:.6f}")
 
+for ep in range(1, epochs+1):
+    model.train()
+    train_l2 = 0
+    counter = 0
+    for x, y in train_loader:
+        x, y = x.to(device), y.to(device)
+
+        optimizer.zero_grad()
+        pred = model(x)
+        loss = myloss(pred.view(y.shape), y)  # Ensure shapes match
+        loss.backward()
+        optimizer.step()
+
+        train_l2 += loss.item()
+        counter += 1
+
+        if counter % 100 == 0:
+            print(f'epoch: {ep}, batch: {counter}/{len(train_loader)}, train loss: {loss.item()/batch_size:.4f}')
+    
+    scheduler.step()
+    print(f'epoch: {ep}, train loss: {train_l2/train_a.shape[0]:.4f}')
+
+    # ========== TESTING AT EACH EPOCH ==========
+    model.eval()
+    l2_total = 0.0
+    h1_total = 0.0
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            pred = model(xb)
+            pred = pred.unsqueeze(-1)
+
+            l2 = compute_l2_loss(pred, yb)
+            h1 = compute_h1_loss(pred, yb)
+
+            l2_total += l2.item()
+            h1_total += h1.item()
+
+    num_batches = len(test_loader)
+    print(f"        Test L2 Norm: {l2_total / num_batches:.6f}")
+    print(f"        Test H1 Norm: {h1_total / num_batches:.6f}")
+    # ===============================================
+
+    lr_ = optimizer.param_groups[0]['lr']
+    if ep % 500 == 0:
+        PATH = f'TrainedModels/darcy_UFNO_{ep}ep_{width}width_{mode1}m1_{mode2}m2_{train_a.shape[0]}train_{lr_:.2e}lr.pth'
+        torch.save(model.state_dict(), PATH)
